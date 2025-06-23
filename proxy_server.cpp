@@ -25,113 +25,160 @@ constexpr int MAX_CLIENTS = 400;                 // max number of client request
 constexpr int MAX_SIZE = 200 * (1 << 20);        // size of the cache (200 MB)
 constexpr int MAX_ELEMENT_SIZE = 10 * (1 << 20); // max size of an element in cache (10 MB)
 
-class CacheElement
-{
-public:
-    string data;                                             // data stores response
-    string url;                                              // url stores the request
-    chrono::time_point<chrono::system_clock> lru_time_track; // lru_time_track stores the latest time the element is accessed
-    shared_ptr<CacheElement> next;                           // pointer to next element
-
-    CacheElement(const string &response_data, const string &request_url)
-        : data(response_data), url(request_url), lru_time_track(chrono::system_clock::now()), next(nullptr) {}
-};
-
-class ProxyServer
+// O(1) LRU Cache Implementation with normalized keys
+class LRUCache
 {
 private:
-    int port_number = 8080;        // Default Port
-    int proxy_socketId;            // socket descriptor of proxy server
-    vector<thread> client_threads; // vector to store client threads
-    sem_t semaphore;               // semaphore for limiting concurrent clients
-    mutex cache_lock;              // mutex for cache synchronization
-    shared_ptr<CacheElement> head; // pointer to the cache
-    size_t cache_size = 0;         // cache_size denotes the current size of the cache
+    class Node
+    {
+    public:
+        string cache_key; // Normalized cache key
+        string data;      // Server response data
+        Node *next;
+        Node *prev;
+        size_t size; 
+
+        Node(const string &_key, const string &_data)
+            : cache_key(_key), data(_data), next(nullptr), prev(nullptr)
+        {
+            size = cache_key.length() + data.length() + sizeof(Node);
+        }
+    };
+
+    Node *head;
+    Node *tail;
+    size_t capacity;
+    size_t current_size;
+    unordered_map<string, Node *> cache_map;
+    mutable mutex cache_mutex;
+
+    void addToHead(Node *node)
+    {
+        node->prev = head;
+        node->next = head->next;
+        head->next->prev = node;
+        head->next = node;
+    }
+
+    void removeNode(Node *node)
+    {
+        node->prev->next = node->next;
+        node->next->prev = node->prev;
+    }
+
+    Node *removeTail()
+    {
+        Node *last_node = tail->prev;
+        removeNode(last_node);
+        return last_node;
+    }
+
+    void moveToHead(Node *node)
+    {
+        removeNode(node);
+        addToHead(node);
+    }
 
 public:
-    ProxyServer(int port = 8080) : port_number(port), head(nullptr)
+    LRUCache(size_t _capacity) : capacity(_capacity), current_size(0)
     {
-        sem_init(&semaphore, 0, MAX_CLIENTS);
+        head = new Node("", "");
+        tail = new Node("", "");
+        head->next = tail;
+        tail->prev = head;
     }
 
-    ~ProxyServer()
+    ~LRUCache()
     {
-        if (proxy_socketId >= 0)
+        lock_guard<mutex> lock(cache_mutex);
+        Node *current = head;
+        while (current)
         {
-            close(proxy_socketId);
+            Node *next = current->next;
+            delete current;
+            current = next;
         }
-        // Wait for all threads to complete
-        for (auto &thread : client_threads)
-        {
-            if (thread.joinable())
-            {
-                thread.join();
-            }
-        }
-        sem_destroy(&semaphore);
     }
 
-    void start()
+    // O(1) get operation
+    string get(const string &cache_key)
     {
-        cout << "Setting Proxy Server Port: " << port_number << endl;
+        lock_guard<mutex> lock(cache_mutex);
 
-        // Create proxy socket
-        proxy_socketId = socket(AF_INET, SOCK_STREAM, 0);
-        if (proxy_socketId < 0)
+        auto it = cache_map.find(cache_key);
+        if (it == cache_map.end())
         {
-            perror("Failed to create socket.\n");
-            exit(1);
+            return ""; // Not found
         }
 
-        int reuse = 1;
-        if (setsockopt(proxy_socketId, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse)) < 0)
+        Node *node = it->second;
+        moveToHead(node);
+
+        cout << "Cache HIT for key: " << cache_key << endl;
+        return node->data;
+    }
+
+    // O(1) put operation
+    bool put(const string &cache_key, const string &data)
+    {
+        lock_guard<mutex> lock(cache_mutex);
+
+        size_t element_size = cache_key.length() + data.length() + sizeof(Node);
+
+        // Check if element is too large
+        if (element_size > MAX_ELEMENT_SIZE)
         {
-            perror("setsockopt(SO_REUSEADDR) failed\n");
+            cout << "Element too large for cache" << endl;
+            return false;
         }
 
-        struct sockaddr_in server_addr;
-        bzero(reinterpret_cast<char *>(&server_addr), sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(port_number);
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-
-        // Bind socket
-        if (bind(proxy_socketId, reinterpret_cast<struct sockaddr *>(&server_addr), sizeof(server_addr)) < 0)
+        auto it = cache_map.find(cache_key);
+        if (it != cache_map.end()) // Already exits in cache_map
         {
-            perror("Port is not free\n");
-            exit(1);
+            // Update existing node
+            Node *node = it->second;
+            current_size -= node->size;
+            node->data = data;
+            node->size = element_size;
+            current_size += element_size;
+            moveToHead(node);
+            cout << "Cache UPDATED for key: " << cache_key << endl;
+            return true;
         }
 
-        cout << "Binding on port: " << port_number << endl;
-
-        // Listen for connections
-        if (listen(proxy_socketId, MAX_CLIENTS) < 0)
+        // Remove nodes until we have space
+        while (current_size + element_size > capacity && cache_map.size() > 0)
         {
-            perror("Error while Listening!\n");
-            exit(1);
+            Node *last_node = removeTail();
+            cache_map.erase(last_node->cache_key);
+            current_size -= last_node->size;
+            cout << "Cache EVICTED key: " << last_node->cache_key << endl;
+            delete last_node;
         }
 
-        cout << "Proxy server started and listening...\n";
+        // Add new node
+        Node *new_node = new Node(cache_key, data);
+        addToHead(new_node);
+        cache_map[cache_key] = new_node;
+        current_size += element_size;
 
-        // Accept connections
-        while (true)
-        {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
+        cout << "Cache ADDED key: " << cache_key << endl;
+        cout << "Cache size: " << cache_map.size() << " elements, "
+             << current_size / (1024 * 1024) << " MB" << endl;
 
-            int client_socketId = accept(proxy_socketId, reinterpret_cast<struct sockaddr *>(&client_addr), &client_len);
+        return true;
+    }
 
-            if (client_socketId < 0)
-            {
-                cerr << "Error in Accepting connection!\n";
-                continue;
-            }
+    size_t size() const
+    {
+        lock_guard<mutex> lock(cache_mutex);
+        return cache_map.size();
+    }
 
-            // Get client info
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-            cout << "Client connected from " << client_ip << ":" << ntohs(client_addr.sin_port) << endl;
-        }
+    size_t getCurrentSize() const
+    {
+        lock_guard<mutex> lock(cache_mutex);
+        return current_size;
     }
 };
 
@@ -151,8 +198,8 @@ int main(int argc, char *argv[])
 
     try
     {
-        ProxyServer server(port);
-        server.start();
+        // ProxyServer server(port);
+        // server.start();
     }
     catch (const exception &e)
     {
