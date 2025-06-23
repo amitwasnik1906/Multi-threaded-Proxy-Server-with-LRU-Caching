@@ -36,7 +36,7 @@ private:
         string data;      // Server response data
         Node *next;
         Node *prev;
-        size_t size; 
+        size_t size;
 
         Node(const string &_key, const string &_data)
             : cache_key(_key), data(_data), next(nullptr), prev(nullptr)
@@ -182,6 +182,102 @@ public:
     }
 };
 
+class ProxyServer
+{
+private:
+    int port_number = 8080; // Default Port
+    int proxy_socketId;     // socket descriptor of proxy server
+    sem_t semaphore;        // semaphore for limiting concurrent clients
+    LRUCache *cache;        // O(1) LRU Cache
+
+public:
+    ProxyServer(int port = 8080) : port_number(port)
+    {
+        sem_init(&semaphore, 0, MAX_CLIENTS);
+        this->cache = new LRUCache(MAX_SIZE);
+    }
+
+    ~ProxyServer()
+    {
+        if (proxy_socketId >= 0)
+        {
+            close(proxy_socketId);
+        }
+        sem_destroy(&semaphore);
+        delete cache;
+    }
+
+    void start()
+    {
+        cout << "Setting Proxy Server Port: " << port_number << endl;
+        cout << "Cache Configuration: Max Size = " << MAX_SIZE / (1024 * 1024)
+             << " MB, Max Element Size = " << MAX_ELEMENT_SIZE / (1024 * 1024) << " MB" << endl;
+
+        // Create proxy socket
+        proxy_socketId = socket(AF_INET, SOCK_STREAM, 0);
+        if (proxy_socketId < 0)
+        {
+            perror("Failed to create socket.\n");
+            exit(1);
+        }
+
+        int reuse = 1;
+        if (setsockopt(proxy_socketId, SOL_SOCKET, SO_REUSEADDR,
+                       reinterpret_cast<const char *>(&reuse), sizeof(reuse)) < 0)
+        {
+            perror("setsockopt(SO_REUSEADDR) failed\n");
+        }
+
+        struct sockaddr_in server_addr;
+        bzero(reinterpret_cast<char *>(&server_addr), sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port_number);
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+
+        // Bind socket
+        if (bind(proxy_socketId, reinterpret_cast<struct sockaddr *>(&server_addr),
+                 sizeof(server_addr)) < 0)
+        {
+            perror("Port is not free\n");
+            exit(1);
+        }
+
+        cout << "Binding on port: " << port_number << endl;
+
+        // Listen for connections
+        if (listen(proxy_socketId, MAX_CLIENTS) < 0)
+        {
+            perror("Error while Listening!\n");
+            exit(1);
+        }
+
+        cout << "Proxy server started and listening with O(1) LRU Cache...\n";
+
+        // Accept connections
+        while (true)
+        {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+
+            int client_socketId = accept(proxy_socketId,
+                                         reinterpret_cast<struct sockaddr *>(&client_addr),
+                                         &client_len);
+
+            if (client_socketId < 0)
+            {
+                cerr << "Error in Accepting connection!\n";
+                continue;
+            }
+
+            // Get client info
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            cout << "\nClient connected from " << client_ip
+                 << ":" << ntohs(client_addr.sin_port) << endl;
+        }
+    }
+};
+
 int main(int argc, char *argv[])
 {
     int port = 8080;
@@ -198,8 +294,8 @@ int main(int argc, char *argv[])
 
     try
     {
-        // ProxyServer server(port);
-        // server.start();
+        ProxyServer server(port);
+        server.start();
     }
     catch (const exception &e)
     {
