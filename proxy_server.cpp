@@ -207,6 +207,117 @@ public:
         delete cache;
     }
 
+    int sendErrorMessage(int socket, int status_code)
+    {
+        string str;
+        char currentTime[50];
+        time_t now = time(nullptr);
+
+        struct tm *data = gmtime(&now);
+        strftime(currentTime, sizeof(currentTime), "%a, %d %b %Y %H:%M:%S %Z", data);
+
+        switch (status_code)
+        {
+        case 400:
+            str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 95\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>400 Bad Request</TITLE></HEAD>\n<BODY><H1>400 Bad Request</H1>\n</BODY></HTML>";
+            cout << "400 Bad Request\n";
+            break;
+        case 403:
+            str = "HTTP/1.1 403 Forbidden\r\nContent-Length: 112\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>403 Forbidden</TITLE></HEAD>\n<BODY><H1>403 Forbidden</H1><br>Permission Denied\n</BODY></HTML>";
+            cout << "403 Forbidden\n";
+            break;
+        case 404:
+            str = "HTTP/1.1 404 Not Found\r\nContent-Length: 91\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>\n<BODY><H1>404 Not Found</H1>\n</BODY></HTML>";
+            cout << "404 Not Found\n";
+            break;
+        case 500:
+            str = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 115\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>500 Internal Server Error</TITLE></HEAD>\n<BODY><H1>500 Internal Server Error</H1>\n</BODY></HTML>";
+            break;
+        case 501:
+            str = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 103\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>501 Not Implemented</TITLE></HEAD>\n<BODY><H1>501 Not Implemented</H1>\n</BODY></HTML>";
+            cout << "501 Not Implemented\n";
+            break;
+        case 505:
+            str = "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 125\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: " +
+                  string(currentTime) + "\r\nServer: ProxyServer/1.0\r\n\r\n<HTML><HEAD><TITLE>505 HTTP Version Not Supported</TITLE></HEAD>\n<BODY><H1>505 HTTP Version Not Supported</H1>\n</BODY></HTML>";
+            cout << "505 HTTP Version Not Supported\n";
+            break;
+        default:
+            return -1;
+        }
+
+        send(socket, str.c_str(), str.length(), 0);
+        return 1;
+    }
+
+    void handleClient(int clientSocket)
+    {
+        sem_wait(&semaphore);
+
+        vector<char> buffer(MAX_BYTES);
+        int bytes_received = recv(clientSocket, buffer.data(), MAX_BYTES - 1, 0);
+
+        while (bytes_received > 0)
+        {
+            buffer[bytes_received] = '\0';
+            string buffer_str(buffer.data());
+
+            // Check if we have complete HTTP request
+            if (buffer_str.find("\r\n\r\n") != string::npos)
+            {
+                break;
+            }
+
+            int additional_bytes = recv(clientSocket, buffer.data() + bytes_received,
+                                        MAX_BYTES - bytes_received - 1, 0);
+            if (additional_bytes <= 0)
+                break;
+            bytes_received += additional_bytes;
+        }
+
+        if (bytes_received <= 0)
+        {
+            if (bytes_received < 0)
+            {
+                perror("Error in receiving from client.\n");
+            }
+            else
+            {
+                cout << "Client disconnected!\n";
+            }
+            shutdown(clientSocket, SHUT_RDWR);
+            close(clientSocket);
+            sem_post(&semaphore);
+            return;
+        }
+
+        buffer[bytes_received] = '\0';
+
+        // Parse request
+        ParsedRequest *request = ParsedRequest_create();
+
+        if (ParsedRequest_parse(request, buffer.data(), bytes_received) < 0)
+        {
+            cout << "Parsing failed\n";
+            sendErrorMessage(clientSocket, 400);
+        }
+        else
+        {
+            // Process request
+            
+        }
+
+        ParsedRequest_destroy(request);
+        shutdown(clientSocket, SHUT_RDWR);
+        close(clientSocket);
+        sem_post(&semaphore);
+    }
+
     void start()
     {
         cout << "Setting Proxy Server Port: " << port_number << endl;
@@ -274,6 +385,11 @@ public:
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
             cout << "\nClient connected from " << client_ip
                  << ":" << ntohs(client_addr.sin_port) << endl;
+
+            // Handle client in a separate thread
+            thread([this, client_socketId]()
+                   { this->handleClient(client_socketId); })
+                .detach();
         }
     }
 };
