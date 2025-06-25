@@ -190,6 +190,62 @@ private:
     sem_t semaphore;        // semaphore for limiting concurrent clients
     LRUCache *cache;        // O(1) LRU Cache
 
+    // Create normalized cache key from request components
+    string createCacheKey(const string &method, const string &host, const string &path, int port)
+    {
+        return method + ":" + host + ":" + to_string(port) + ":" + path;
+    }
+
+    // Parse proxy URL format like /https://example.com/path
+    bool parseProxyURL(const string &path, string &target_host, int &target_port, string &target_path)
+    {
+        if (path.length() > 1 && path[0] == '/')
+        {
+            string url_part = path.substr(1); // Remove leading '/'
+
+            // Check if it starts with http:// or https://
+            if (url_part.substr(0, 7) == "http://")
+            {
+                url_part = url_part.substr(7); // Remove "http://"
+                target_port = 80;
+            }
+            else if (url_part.substr(0, 8) == "https://")
+            {
+                url_part = url_part.substr(8); // Remove "https://"
+                target_port = 443;
+            }
+            else
+            {
+                return false; // Not a valid proxy URL format
+            }
+
+            // Find the first '/' to separate host from path
+            size_t slash_pos = url_part.find('/');
+            if (slash_pos == string::npos)
+            {
+                target_host = url_part;
+                target_path = "/";
+            }
+            else
+            {
+                target_host = url_part.substr(0, slash_pos);
+                target_path = url_part.substr(slash_pos);
+            }
+
+            // Check for port in host (host:port format)
+            size_t colon_pos = target_host.find(':');
+            if (colon_pos != string::npos)
+            {
+                target_port = stoi(target_host.substr(colon_pos + 1));
+                target_host = target_host.substr(0, colon_pos);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
 public:
     ProxyServer(int port = 8080) : port_number(port)
     {
@@ -255,6 +311,113 @@ public:
         return 1;
     }
 
+    bool checkHTTPversion(const string &version)
+    {
+        return (version == "HTTP/1.1" || version == "HTTP/1.0");
+    }
+
+    int connectRemoteServer(const string &host_addr, int port_num)
+    {
+        // Creating Socket for remote server
+        int remoteSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+        if (remoteSocket < 0)
+        {
+            cerr << "Error in Creating Socket.\n";
+            return -1;
+        }
+
+        // Get host by the name or ip address provided
+        struct hostent *host = gethostbyname(host_addr.c_str());
+        if (host == nullptr)
+        {
+            cerr << "No such host exists.\n";
+            return -1;
+        }
+
+        // inserts ip address and port number of host in struct `server_addr`
+        struct sockaddr_in server_addr;
+        bzero(reinterpret_cast<char *>(&server_addr), sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port_num);
+
+        bcopy(reinterpret_cast<char *>(host->h_addr),
+              reinterpret_cast<char *>(&server_addr.sin_addr.s_addr),
+              host->h_length);
+
+        // Connect to Remote server
+        if (connect(remoteSocket, reinterpret_cast<struct sockaddr *>(&server_addr),
+                    static_cast<socklen_t>(sizeof(server_addr))) < 0)
+        {
+            cerr << "Error in connecting!\n";
+            return -1;
+        }
+
+        return remoteSocket;
+    }
+
+    int handleRequest(int clientSocket, ParsedRequest *request, const string &cache_key)
+    {
+        string buf = "GET " + string(request->path) + " " +
+                     string(request->version) + "\r\n";
+
+        if (ParsedHeader_set(request, "Connection", "close") < 0)
+        {
+            cout << "set header key not work\n";
+        }
+
+        if (ParsedHeader_get(request, "Host") == nullptr)
+        {
+            if (ParsedHeader_set(request, "Host", request->host) < 0)
+            {
+                cout << "Set \"Host\" header key not working\n";
+            }
+        }
+
+        char header_buf[MAX_BYTES];
+        if (ParsedRequest_unparse_headers(request, header_buf, MAX_BYTES - buf.length()) >= 0)
+        {
+            buf += string(header_buf);
+        }
+
+        int server_port = 80; // Default Remote Server Port
+        if (request->port != nullptr)
+        {
+            server_port = stoi(request->port);
+        }
+
+        int remoteSocketID = connectRemoteServer(string(request->host), server_port);
+        if (remoteSocketID < 0)
+        {
+            return -1;
+        }
+
+        send(remoteSocketID, buf.c_str(), buf.length(), 0);
+
+        string response_data;
+        char buffer[MAX_BYTES];
+        int bytes_received;
+
+        while ((bytes_received = recv(remoteSocketID, buffer, MAX_BYTES - 1, 0)) > 0)
+        {
+            send(clientSocket, buffer, bytes_received, 0);
+            response_data.append(buffer, bytes_received);
+
+            if (bytes_received < 0)
+            {
+                perror("Error in sending data to client socket.\n");
+                break;
+            }
+        }
+
+        // Add to cache with normalized key
+        cache->put(cache_key, response_data);
+        cout << "Response cached successfully with key: " << cache_key << endl;
+
+        close(remoteSocketID);
+        return 0;
+    }
+
     void handleClient(int clientSocket)
     {
         sem_wait(&semaphore);
@@ -309,7 +472,74 @@ public:
         else
         {
             // Process request
-            
+            if (string(request->method) == "GET")
+            {
+                string target_host, target_path;
+                int target_port;
+
+                // Check if this is a proxy URL format like /https://example.com
+                if (parseProxyURL(string(request->path), target_host, target_port, target_path))
+                {
+                    cout << "Proxy URL format detected - Host: " << target_host
+                         << ", Port: " << target_port << ", Path: " << target_path << endl;
+
+                    // Update the request object for proxy URL
+                    if (request->host)
+                        free(request->host);
+                    if (request->path)
+                        free(request->path);
+                    if (request->port)
+                        free(request->port);
+
+                    request->host = strdup(target_host.c_str());
+                    request->path = strdup(target_path.c_str());
+                    request->port = strdup(to_string(target_port).c_str());
+                }
+
+                if (request->host && request->path && checkHTTPversion(string(request->version)))
+                {
+                    // Create normalized cache key
+                    int port = 80; // default
+                    if (request->port != nullptr)
+                    {
+                        port = stoi(request->port);
+                    }
+
+                    string cache_key = createCacheKey(
+                        string(request->method),
+                        string(request->host),
+                        string(request->path),
+                        port);
+
+                    cout << "Generated cache key: " << cache_key << endl;
+
+                    // Check cache first with normalized key
+                    string cached_data = cache->get(cache_key);
+                    if (!cached_data.empty())
+                    {
+                        cout << "Data retrieved from Cache (O(1) lookup)" << endl;
+                        send(clientSocket, cached_data.c_str(), cached_data.length(), 0);
+                    }
+                    else
+                    {
+                        cout << "Cache MISS - fetching from server" << endl;
+                        if (handleRequest(clientSocket, request, cache_key) == -1)
+                        {
+                            sendErrorMessage(clientSocket, 500);
+                        }
+                    }
+                }
+                else
+                {
+                    cout << "Invalid request components" << endl;
+                    sendErrorMessage(clientSocket, 500);
+                }
+            }
+            else
+            {
+                cout << "This code doesn't support any method other than GET\n";
+                sendErrorMessage(clientSocket, 501);
+            }
         }
 
         ParsedRequest_destroy(request);
