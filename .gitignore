@@ -2,3 +2,4 @@ proxy
 proxy_parse.o
 proxy.o
 .vscode
+docker-compose.yml

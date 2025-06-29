@@ -196,56 +196,6 @@ private:
         return method + ":" + host + ":" + to_string(port) + ":" + path;
     }
 
-    // Parse proxy URL format like /https://example.com/path
-    bool parseProxyURL(const string &path, string &target_host, int &target_port, string &target_path)
-    {
-        if (path.length() > 1 && path[0] == '/')
-        {
-            string url_part = path.substr(1); // Remove leading '/'
-
-            // Check if it starts with http:// or https://
-            if (url_part.substr(0, 7) == "http://")
-            {
-                url_part = url_part.substr(7); // Remove "http://"
-                target_port = 80;
-            }
-            else if (url_part.substr(0, 8) == "https://")
-            {
-                url_part = url_part.substr(8); // Remove "https://"
-                target_port = 443;
-            }
-            else
-            {
-                return false; // Not a valid proxy URL format
-            }
-
-            // Find the first '/' to separate host from path
-            size_t slash_pos = url_part.find('/');
-            if (slash_pos == string::npos)
-            {
-                target_host = url_part;
-                target_path = "/";
-            }
-            else
-            {
-                target_host = url_part.substr(0, slash_pos);
-                target_path = url_part.substr(slash_pos);
-            }
-
-            // Check for port in host (host:port format)
-            size_t colon_pos = target_host.find(':');
-            if (colon_pos != string::npos)
-            {
-                target_port = stoi(target_host.substr(colon_pos + 1));
-                target_host = target_host.substr(0, colon_pos);
-            }
-
-            return true;
-        }
-
-        return false;
-    }
-
 public:
     ProxyServer(int port = 8080) : port_number(port)
     {
@@ -358,6 +308,7 @@ public:
 
     int handleRequest(int clientSocket, ParsedRequest *request, const string &cache_key)
     {
+        cout<<"\nRequesting to the Remote Server";
         string buf = "GET " + string(request->path) + " " +
                      string(request->version) + "\r\n";
 
@@ -474,28 +425,6 @@ public:
             // Process request
             if (string(request->method) == "GET")
             {
-                string target_host, target_path;
-                int target_port;
-
-                // Check if this is a proxy URL format like /https://example.com
-                if (parseProxyURL(string(request->path), target_host, target_port, target_path))
-                {
-                    cout << "Proxy URL format detected - Host: " << target_host
-                         << ", Port: " << target_port << ", Path: " << target_path << endl;
-
-                    // Update the request object for proxy URL
-                    if (request->host)
-                        free(request->host);
-                    if (request->path)
-                        free(request->path);
-                    if (request->port)
-                        free(request->port);
-
-                    request->host = strdup(target_host.c_str());
-                    request->path = strdup(target_path.c_str());
-                    request->port = strdup(to_string(target_port).c_str());
-                }
-
                 if (request->host && request->path && checkHTTPversion(string(request->version)))
                 {
                     // Create normalized cache key
@@ -613,6 +542,7 @@ public:
             // Get client info
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            cout<<"\n----------------------------------------------------------"<<endl;
             cout << "\nClient connected from " << client_ip
                  << ":" << ntohs(client_addr.sin_port) << endl;
 
